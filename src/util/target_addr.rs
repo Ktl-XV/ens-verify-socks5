@@ -3,6 +3,7 @@ use crate::consts::SOCKS5_ADDR_TYPE_IPV4;
 use crate::read_exact;
 use crate::SocksError;
 use anyhow::Context;
+use regex::Regex;
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -11,6 +12,92 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::lookup_host;
 
+use ethers::prelude::*;
+
+extern crate redis;
+use base64::{engine::general_purpose, Engine as _};
+use redis::{Commands, SetExpiry, SetOptions};
+use rustls;
+use std::net::TcpStream;
+use std::str::FromStr;
+use std::sync::Arc;
+use webpki_roots;
+
+use std::io::Write;
+
+use rustls::{
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    pki_types::{CertificateDer, ServerName, UnixTime as pkiUnixTime},
+    CertificateError, ClientConfig, DigitallySignedStruct, Error, SignatureScheme,
+};
+
+use x509_certificate::certificate::X509Certificate;
+
+#[derive(Debug)]
+struct MyServerCertVerifier {}
+
+impl ServerCertVerifier for MyServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName,
+        _ocsp_response: &[u8],
+        now: pkiUnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let cert = X509Certificate::from_der(end_entity).unwrap();
+
+        if server_name.to_str() != cert.subject_common_name().unwrap() {
+            return Err(Error::InvalidCertificate(CertificateError::NotValidForName));
+        }
+
+        if now.as_secs() < cert.validity_not_before().timestamp() as u64 {
+            return Err(Error::InvalidCertificate(CertificateError::NotValidYet));
+        }
+
+        if now.as_secs() > cert.validity_not_after().timestamp() as u64 {
+            return Err(Error::InvalidCertificate(CertificateError::Expired));
+        }
+
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA1,
+            SignatureScheme::ECDSA_SHA1_Legacy,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ED25519,
+            SignatureScheme::ED448,
+        ]
+    }
+}
 /// SOCKS5 reply code
 #[derive(Error, Debug)]
 pub enum AddrError {
@@ -48,31 +135,200 @@ pub enum TargetAddr {
 
 impl TargetAddr {
     pub async fn resolve_dns(self) -> anyhow::Result<TargetAddr> {
+        let redis_client = redis::Client::open("redis://127.0.0.1/")?;
+        let mut redis_con = redis_client.get_connection()?;
+
+        let redis_opts = SetOptions::default().with_expiration(SetExpiry::EX(5)); //TODO: increase
+                                                                                  //cache time
+
         match self {
             TargetAddr::Ip(ip) => Ok(TargetAddr::Ip(ip)),
             TargetAddr::Domain(domain, port) => {
                 debug!("Attempt to DNS resolve the domain {}...", &domain);
+                let maybe_socket: Option<String> = redis_con.get(&domain)?;
 
-                let socket_addr = lookup_host((&domain[..], port))
-                    .await
-                    .context(AddrError::DNSResolutionFailed)?
-                    .next()
-                    .ok_or(AddrError::Custom(
-                        "Can't fetch DNS to the domain.".to_string(),
-                    ))?;
-                debug!("domain name resolved to {}", socket_addr);
+                match maybe_socket {
+                    Some(socket) => {
+                        debug!("Domain found in cache: {}", domain);
 
-                // has been converted to an ip
-                Ok(TargetAddr::Ip(socket_addr))
+                        Ok(TargetAddr::Ip(
+                            SocketAddr::from_str(socket.as_str()).unwrap(),
+                        ))
+                    }
+                    None => {
+                        debug!("Domain not found in cache");
+
+                        let re = Regex::new(r"www\..+\.eth").unwrap();
+                        let is_www_eth = re.is_match(&domain);
+                        let eth_provider = Provider::<Http>::try_from(
+                            "https://ethereum-sepolia-rpc.publicnode.com",
+                        )?;
+
+                        match is_www_eth {
+                            true => {
+                                debug!("Looking for www.eth domain");
+
+                                let resolved_socket =
+                                    eth_provider.resolve_field(&domain, "socket").await?;
+                                let resolved_cert =
+                                    eth_provider.resolve_field(&domain, "certificate").await?;
+
+                                let config = ClientConfig::builder()
+                                    .dangerous()
+                                    .with_custom_certificate_verifier(Arc::new(
+                                        MyServerCertVerifier {},
+                                    ))
+                                    .with_no_client_auth();
+
+                                let rc_config = Arc::new(config);
+                                let parsed_domain = domain.clone().try_into().unwrap();
+
+                                let mut client =
+                                    rustls::ClientConnection::new(rc_config, parsed_domain)
+                                        .unwrap();
+
+                                let mut sock = TcpStream::connect(resolved_socket.clone()).unwrap();
+
+                                let mut tls = rustls::Stream::new(&mut client, &mut sock);
+                                tls.write_all(
+                                    format!(
+                                        concat!(
+                                            "GET / HTTP/1.1\r\n",
+                                            "Host: {}\r\n",
+                                            "Connection: close\r\n",
+                                            "Accept-Encoding: identity\r\n",
+                                            "\r\n"
+                                        ),
+                                        domain
+                                    )
+                                    .as_bytes(),
+                                )
+                                .unwrap();
+
+                                let server_certs = client.peer_certificates().unwrap();
+
+                                let cert = &server_certs[0];
+
+                                let cert_base64 = general_purpose::STANDARD.encode(cert);
+
+                                if cert_base64 == resolved_cert {
+                                    debug!("Key matches DNS secure, adding to cache");
+                                    let socket_addr =
+                                        SocketAddr::from_str(resolved_socket.as_str()).unwrap();
+
+                                    redis_con.set_options(
+                                        &domain,
+                                        format!("{:?}", socket_addr),
+                                        redis_opts,
+                                    )?;
+                                    Ok(TargetAddr::Ip(socket_addr))
+                                } else {
+                                    error!("Key does not match, blocking");
+
+                                    Err(AddrError::Custom(
+                                        "Possibly fake certificate detected".to_string(),
+                                    )
+                                    .into())
+                                }
+                            }
+                            false => {
+                                let socket_addr = lookup_host((&domain[..], port))
+                                    .await
+                                    .context(AddrError::DNSResolutionFailed)?
+                                    .next()
+                                    .ok_or(AddrError::Custom(
+                                        "Can't fetch DNS to the domain.".to_string(),
+                                    ))?;
+                                debug!("domain name resolved to {}", socket_addr);
+
+                                if port == 443 {
+                                    let maybe_cert =
+                                        eth_provider.resolve_field(&domain, "certificate").await;
+
+                                    match maybe_cert {
+                                        Ok(ens_cert) => {
+                                            let root_store = rustls::RootCertStore::from_iter(
+                                                webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+                                            );
+                                            let config = rustls::ClientConfig::builder()
+                                                .with_root_certificates(root_store)
+                                                .with_no_client_auth();
+                                            let rc_config = Arc::new(config);
+                                            let parsed_domain = domain.clone().try_into().unwrap();
+
+                                            let mut client = rustls::ClientConnection::new(
+                                                rc_config,
+                                                parsed_domain,
+                                            )
+                                            .unwrap();
+
+                                            let mut sock =
+                                                TcpStream::connect(format!("{}:443", domain))
+                                                    .unwrap();
+
+                                            let mut tls =
+                                                rustls::Stream::new(&mut client, &mut sock);
+                                            tls.write_all(
+                                                format!(
+                                                    concat!(
+                                                        "GET / HTTP/1.1\r\n",
+                                                        "Host: {}\r\n",
+                                                        "Connection: close\r\n",
+                                                        "Accept-Encoding: identity\r\n",
+                                                        "\r\n"
+                                                    ),
+                                                    domain
+                                                )
+                                                .as_bytes(),
+                                            )
+                                            .unwrap();
+
+                                            let server_certs = client.peer_certificates().unwrap();
+
+                                            let cert = &server_certs[0];
+
+                                            let cert_base64 =
+                                                general_purpose::STANDARD.encode(cert);
+
+                                            if cert_base64 == ens_cert {
+                                                debug!("Key matches DNS secure, adding to cache");
+                                                redis_con.set_options(
+                                                    &domain,
+                                                    format!("{:?}", socket_addr),
+                                                    redis_opts,
+                                                )?;
+                                                return Ok(TargetAddr::Ip(socket_addr));
+                                            } else {
+                                                error!("Key does not match, blocking");
+
+                                                return Err(AddrError::Custom(
+                                                    "Possibly fake certificate detected"
+                                                        .to_string(),
+                                                )
+                                                .into());
+                                            }
+                                        }
+                                        Err(_) => {
+                                            debug!("No ENS");
+                                            redis_con.set_options(
+                                                &domain,
+                                                format!("{:?}", socket_addr),
+                                                redis_opts,
+                                            )?;
+                                        }
+                                    }
+                                }
+                                Ok(TargetAddr::Ip(socket_addr))
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
     pub fn is_ip(&self) -> bool {
-        match self {
-            TargetAddr::Ip(_) => true,
-            _ => false,
-        }
+        matches!(self, TargetAddr::Ip(_))
     }
 
     pub fn is_domain(&self) -> bool {
